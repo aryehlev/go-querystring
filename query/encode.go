@@ -26,6 +26,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -145,134 +146,183 @@ func Values(v interface{}) (url.Values, error) {
 	return values, err
 }
 
-// reflectValue populates the values parameter from the struct fields in val.
-// Embedded structs are followed recursively (using the rules defined in the
-// Values function documentation) breadth-first.
-func reflectValue(values url.Values, val reflect.Value, scope string) error {
-	var embedded []reflect.Value
+// The encoding rules above depend only on a field's type and struct tag, never on its
+// value, so they are resolved once per struct type into a structPlan and cached. Each
+// Values call then walks the plan instead of re-reading and re-parsing every tag, and
+// formats scalars with strconv instead of boxing them through fmt.Sprint.
 
-	typ := val.Type()
-	for i := 0; i < typ.NumField(); i++ {
-		sf := typ.Field(i)
+// structPlan is the per-type result of resolving struct tags.
+type structPlan struct {
+	fields []fieldPlan
+}
+
+// fieldPlan is everything reflectValue needs to know about one struct field that does not
+// depend on the field's value.
+type fieldPlan struct {
+	index int
+	name  string // tag name, or the Go field name when the tag has none
+
+	// embedded is set for an anonymous field with no tag name. Whether its fields are
+	// promoted still depends on the value: a nil pointer to a struct is encoded as a
+	// regular field named after the Go field.
+	embedded bool
+
+	// url tag options
+	omitEmpty bool
+	boolInt   bool
+	comma     bool
+	space     bool
+	semicolon bool
+	brackets  bool
+	numbered  bool
+	unix      bool
+	unixMilli bool
+	unixNano  bool
+
+	del    string // "del" struct tag
+	layout string // "layout" struct tag
+
+	// info describes the field's static type. It is nil for interface-typed fields, whose
+	// concrete type is only known at encode time.
+	info *typeInfo
+}
+
+// typeInfo caches the type-level questions the encoder asks about a value.
+type typeInfo struct {
+	implementsEncoder     bool // t implements Encoder
+	elemImplementsEncoder bool // t is a pointer type whose element type implements Encoder
+	zeroable              bool // t has an IsZero() bool method
+
+	// base is what remains after dereferencing every pointer level of t.
+	baseKind       reflect.Kind
+	baseIsTime     bool // base == time.Time
+	baseUsesSprint bool // base implements fmt.Formatter, fmt.Stringer or error, so fmt decides its text
+}
+
+type zeroable interface {
+	IsZero() bool
+}
+
+var (
+	stringerType  = reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
+	errorType     = reflect.TypeOf((*error)(nil)).Elem()
+	formatterType = reflect.TypeOf((*fmt.Formatter)(nil)).Elem()
+	zeroableType  = reflect.TypeOf((*zeroable)(nil)).Elem()
+)
+
+var (
+	plans     sync.Map // reflect.Type -> *structPlan
+	typeInfos sync.Map // reflect.Type -> *typeInfo
+)
+
+// planFor returns the cached structPlan for the struct type t, building it on first use.
+// Nested and embedded struct types are resolved lazily at encode time, so recursive
+// types do not recurse here.
+func planFor(t reflect.Type) *structPlan {
+	if p, ok := plans.Load(t); ok {
+		return p.(*structPlan)
+	}
+
+	p := &structPlan{}
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
 		if sf.PkgPath != "" && !sf.Anonymous { // unexported
 			continue
 		}
 
-		sv := val.Field(i)
 		tag := sf.Tag.Get("url")
 		if tag == "-" {
 			continue
 		}
 		name, opts := parseTag(tag)
 
-		if name == "" {
-			if sf.Anonymous {
-				v := reflect.Indirect(sv)
-				if v.IsValid() && v.Kind() == reflect.Struct {
-					// save embedded struct for later processing
-					embedded = append(embedded, v)
-					continue
-				}
-			}
-
-			name = sf.Name
+		f := fieldPlan{
+			index:     i,
+			name:      name,
+			embedded:  name == "" && sf.Anonymous,
+			omitEmpty: opts.Contains("omitempty"),
+			boolInt:   opts.Contains("int"),
+			comma:     opts.Contains("comma"),
+			space:     opts.Contains("space"),
+			semicolon: opts.Contains("semicolon"),
+			brackets:  opts.Contains("brackets"),
+			numbered:  opts.Contains("numbered"),
+			unix:      opts.Contains("unix"),
+			unixMilli: opts.Contains("unixmilli"),
+			unixNano:  opts.Contains("unixnano"),
+			del:       sf.Tag.Get("del"),
+			layout:    sf.Tag.Get("layout"),
+		}
+		if f.name == "" {
+			f.name = sf.Name
+		}
+		if sf.Type.Kind() != reflect.Interface {
+			f.info = typeInfoFor(sf.Type)
 		}
 
+		p.fields = append(p.fields, f)
+	}
+
+	actual, _ := plans.LoadOrStore(t, p)
+	return actual.(*structPlan)
+}
+
+// typeInfoFor returns the cached typeInfo for t, building it on first use.
+func typeInfoFor(t reflect.Type) *typeInfo {
+	if ti, ok := typeInfos.Load(t); ok {
+		return ti.(*typeInfo)
+	}
+
+	ti := &typeInfo{
+		implementsEncoder:     t.Implements(encoderType),
+		elemImplementsEncoder: t.Kind() == reflect.Ptr && t.Elem().Implements(encoderType),
+		zeroable:              t.Implements(zeroableType),
+	}
+
+	base := t
+	for base.Kind() == reflect.Ptr {
+		base = base.Elem()
+	}
+	ti.baseKind = base.Kind()
+	ti.baseIsTime = base == timeType
+	ti.baseUsesSprint = base.Implements(formatterType) || base.Implements(stringerType) || base.Implements(errorType)
+
+	actual, _ := typeInfos.LoadOrStore(t, ti)
+	return actual.(*typeInfo)
+}
+
+// reflectValue populates the values parameter from the struct fields in val.
+// Embedded structs are followed recursively (using the rules defined in the
+// Values function documentation) breadth-first.
+func reflectValue(values url.Values, val reflect.Value, scope string) error {
+	var embedded []reflect.Value
+
+	plan := planFor(val.Type())
+	for i := range plan.fields {
+		f := &plan.fields[i]
+		sv := val.Field(f.index)
+
+		if f.embedded {
+			v := reflect.Indirect(sv)
+			if v.IsValid() && v.Kind() == reflect.Struct {
+				// save embedded struct for later processing
+				embedded = append(embedded, v)
+				continue
+			}
+		}
+
+		name := f.name
 		if scope != "" {
 			name = scope + "[" + name + "]"
 		}
 
-		if opts.Contains("omitempty") && isEmptyValue(sv) {
-			continue
+		if err := encodeField(values, sv, name, f); err != nil {
+			return err
 		}
-
-		// unwrap interface values so the concrete type's Encoder is used
-		if sv.Kind() == reflect.Interface && !sv.IsNil() {
-			sv = sv.Elem()
-		}
-
-		if sv.Type().Implements(encoderType) {
-			// if sv is a nil pointer and the custom encoder is defined on a non-pointer
-			// method receiver, set sv to the zero value of the underlying type
-			if !reflect.Indirect(sv).IsValid() && sv.Type().Elem().Implements(encoderType) {
-				sv = reflect.New(sv.Type().Elem())
-			}
-
-			m := sv.Interface().(Encoder)
-			if err := m.EncodeValues(name, &values); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// recursively dereference pointers. break on nil pointers
-		for sv.Kind() == reflect.Ptr {
-			if sv.IsNil() {
-				break
-			}
-			sv = sv.Elem()
-		}
-
-		if sv.Kind() == reflect.Slice || sv.Kind() == reflect.Array {
-			if sv.Len() == 0 {
-				// skip if slice or array is empty
-				continue
-			}
-
-			var del string
-			if opts.Contains("comma") {
-				del = ","
-			} else if opts.Contains("space") {
-				del = " "
-			} else if opts.Contains("semicolon") {
-				del = ";"
-			} else if opts.Contains("brackets") {
-				name = name + "[]"
-			} else {
-				del = sf.Tag.Get("del")
-			}
-
-			if del != "" {
-				s := new(strings.Builder)
-				first := true
-				for i := 0; i < sv.Len(); i++ {
-					if first {
-						first = false
-					} else {
-						s.WriteString(del)
-					}
-					s.WriteString(valueString(sv.Index(i), opts, sf))
-				}
-				values.Add(name, s.String())
-			} else {
-				for i := 0; i < sv.Len(); i++ {
-					k := name
-					if opts.Contains("numbered") {
-						k = fmt.Sprintf("%s%d", name, i)
-					}
-					values.Add(k, valueString(sv.Index(i), opts, sf))
-				}
-			}
-			continue
-		}
-
-		if sv.Type() == timeType {
-			values.Add(name, valueString(sv, opts, sf))
-			continue
-		}
-
-		if sv.Kind() == reflect.Struct {
-			if err := reflectValue(values, sv, name); err != nil {
-				return err
-			}
-			continue
-		}
-
-		values.Add(name, valueString(sv, opts, sf))
 	}
 
-	for _, f := range embedded {
-		if err := reflectValue(values, f, scope); err != nil {
+	for _, v := range embedded {
+		if err := reflectValue(values, v, scope); err != nil {
 			return err
 		}
 	}
@@ -280,8 +330,99 @@ func reflectValue(values url.Values, val reflect.Value, scope string) error {
 	return nil
 }
 
-// valueString returns the string representation of a value.
-func valueString(v reflect.Value, opts tagOptions, sf reflect.StructField) string {
+// encodeField adds the URL values for one struct field.
+func encodeField(values url.Values, sv reflect.Value, name string, f *fieldPlan) error {
+	info := f.info
+
+	if f.omitEmpty && isEmpty(sv, info) {
+		return nil
+	}
+
+	// unwrap interface values so the concrete type's Encoder is used
+	if sv.Kind() == reflect.Interface && !sv.IsNil() {
+		sv = sv.Elem()
+	}
+	if info == nil {
+		info = typeInfoFor(sv.Type())
+	}
+
+	if info.implementsEncoder {
+		// if sv is a nil pointer and the custom encoder is defined on a non-pointer
+		// method receiver, set sv to the zero value of the underlying type
+		if sv.Kind() == reflect.Ptr && sv.IsNil() && info.elemImplementsEncoder {
+			sv = reflect.New(sv.Type().Elem())
+		}
+
+		m := sv.Interface().(Encoder)
+		return m.EncodeValues(name, &values)
+	}
+
+	// recursively dereference pointers. break on nil pointers
+	for sv.Kind() == reflect.Ptr {
+		if sv.IsNil() {
+			break
+		}
+		sv = sv.Elem()
+	}
+
+	if sv.Kind() == reflect.Slice || sv.Kind() == reflect.Array {
+		if sv.Len() == 0 {
+			// skip if slice or array is empty
+			return nil
+		}
+
+		var del string
+		if f.comma {
+			del = ","
+		} else if f.space {
+			del = " "
+		} else if f.semicolon {
+			del = ";"
+		} else if f.brackets {
+			name = name + "[]"
+		} else {
+			del = f.del
+		}
+
+		elemInfo := typeInfoFor(sv.Type().Elem())
+
+		if del != "" {
+			s := new(strings.Builder)
+			for i := 0; i < sv.Len(); i++ {
+				if i > 0 {
+					s.WriteString(del)
+				}
+				s.WriteString(formatValue(sv.Index(i), f, elemInfo))
+			}
+			values.Add(name, s.String())
+		} else {
+			for i := 0; i < sv.Len(); i++ {
+				k := name
+				if f.numbered {
+					k = name + strconv.Itoa(i)
+				}
+				values.Add(k, formatValue(sv.Index(i), f, elemInfo))
+			}
+		}
+		return nil
+	}
+
+	if sv.Type() == timeType {
+		values.Add(name, formatValue(sv, f, info))
+		return nil
+	}
+
+	if sv.Kind() == reflect.Struct {
+		return reflectValue(values, sv, name)
+	}
+
+	values.Add(name, formatValue(sv, f, info))
+	return nil
+}
+
+// formatValue returns the string representation of v. info describes v's static type,
+// before any pointer dereferencing.
+func formatValue(v reflect.Value, f *fieldPlan, info *typeInfo) string {
 	for v.Kind() == reflect.Ptr {
 		if v.IsNil() {
 			return ""
@@ -289,36 +430,55 @@ func valueString(v reflect.Value, opts tagOptions, sf reflect.StructField) strin
 		v = v.Elem()
 	}
 
-	if v.Kind() == reflect.Bool && opts.Contains("int") {
+	if info.baseKind == reflect.Bool && f.boolInt {
 		if v.Bool() {
 			return "1"
 		}
 		return "0"
 	}
 
-	if v.Type() == timeType {
+	if info.baseIsTime {
 		t := v.Interface().(time.Time)
-		if opts.Contains("unix") {
+		if f.unix {
 			return strconv.FormatInt(t.Unix(), 10)
 		}
-		if opts.Contains("unixmilli") {
+		if f.unixMilli {
 			return strconv.FormatInt((t.UnixNano() / 1e6), 10)
 		}
-		if opts.Contains("unixnano") {
+		if f.unixNano {
 			return strconv.FormatInt(t.UnixNano(), 10)
 		}
-		if layout := sf.Tag.Get("layout"); layout != "" {
-			return t.Format(layout)
+		if f.layout != "" {
+			return t.Format(f.layout)
 		}
 		return t.Format(time.RFC3339)
+	}
+
+	if !info.baseUsesSprint {
+		// These are exactly the representations fmt.Sprint would produce for the plain kinds.
+		switch info.baseKind {
+		case reflect.String:
+			return v.String()
+		case reflect.Bool:
+			return strconv.FormatBool(v.Bool())
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			return strconv.FormatInt(v.Int(), 10)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			return strconv.FormatUint(v.Uint(), 10)
+		case reflect.Float32:
+			return strconv.FormatFloat(v.Float(), 'g', -1, 32)
+		case reflect.Float64:
+			return strconv.FormatFloat(v.Float(), 'g', -1, 64)
+		}
 	}
 
 	return fmt.Sprint(v.Interface())
 }
 
-// isEmptyValue checks if a value should be considered empty for the purposes
-// of omitting fields with the "omitempty" option.
-func isEmptyValue(v reflect.Value) bool {
+// isEmpty checks if a value should be considered empty for the purposes of omitting
+// fields with the "omitempty" option. info describes v's type, or is nil when it is
+// not known statically.
+func isEmpty(v reflect.Value, info *typeInfo) bool {
 	switch v.Kind() {
 	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
 		return v.Len() == 0
@@ -334,15 +494,20 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.IsNil()
 	}
 
-	type zeroable interface {
-		IsZero() bool
+	if info == nil {
+		info = typeInfoFor(v.Type())
 	}
-
-	if z, ok := v.Interface().(zeroable); ok {
-		return z.IsZero()
+	if info.zeroable {
+		return v.Interface().(zeroable).IsZero()
 	}
 
 	return false
+}
+
+// isEmptyValue checks if a value should be considered empty for the purposes
+// of omitting fields with the "omitempty" option.
+func isEmptyValue(v reflect.Value) bool {
+	return isEmpty(v, nil)
 }
 
 // tagOptions is the string following a comma in a struct field's "url" tag, or
