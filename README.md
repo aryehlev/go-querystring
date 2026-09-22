@@ -1,19 +1,18 @@
 # go-querystring #
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/google/go-querystring/query.svg)](https://pkg.go.dev/github.com/google/go-querystring/query)
-[![Test Status](https://github.com/google/go-querystring/workflows/tests/badge.svg)](https://github.com/google/go-querystring/actions?query=workflow%3Atests)
-[![Test Coverage](https://codecov.io/gh/google/go-querystring/branch/master/graph/badge.svg)](https://codecov.io/gh/google/go-querystring)
+[![Go Reference](https://pkg.go.dev/badge/github.com/aryehlev/go-querystring/query.svg)](https://pkg.go.dev/github.com/aryehlev/go-querystring/query)
+[![Test Status](https://github.com/aryehlev/go-querystring/workflows/tests/badge.svg)](https://github.com/aryehlev/go-querystring/actions?query=workflow%3Atests)
 
 go-querystring is a Go library for encoding structs into URL query parameters.
 
 This is a fork of [google/go-querystring](https://github.com/google/go-querystring)
-with a faster encoder. The API, the module path and the encoding rules are unchanged;
-see [Performance](#performance) below.
+with a faster encoder. The API and the encoding rules are unchanged; see
+[Performance](#performance) below. Import it as `github.com/aryehlev/go-querystring/query`.
 
 ## Usage ##
 
 ```go
-import "github.com/google/go-querystring/query"
+import "github.com/aryehlev/go-querystring/query"
 ```
 
 go-querystring is designed to assist in scenarios where you want to construct a
@@ -39,7 +38,7 @@ See the [package godocs][] for complete documentation on supported types and
 formatting options.
 
 [go-github]: https://github.com/google/go-github/commit/994f6f8405f052a117d2d0b500054341048fbb08
-[package godocs]: https://pkg.go.dev/github.com/google/go-querystring/query
+[package godocs]: https://pkg.go.dev/github.com/aryehlev/go-querystring/query
 
 ## Performance ##
 
